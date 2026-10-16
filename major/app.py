@@ -709,6 +709,17 @@ HTML_TEMPLATE = """
                     <!-- FULL TEXT DISPLAY -->
                     <div id="fullTextDisplay" class="text-output-box">Upload an image and click 'Extract Text' to read content...</div>
 
+                    <!-- PREPROCESSED EASYOCR INPUT CROP DISPLAY -->
+                    <div id="preprocessedCropContainer" style="display: none; margin-bottom: 16px; background: rgba(9, 13, 22, 0.85); border: 1px solid var(--border-active); border-radius: 12px; padding: 14px;">
+                        <div style="font-size: 13px; font-weight: 600; color: var(--accent-cyan); margin-bottom: 10px; display: flex; align-items: center; justify-content: space-between;">
+                            <span><i class="fa-solid fa-microchip"></i> Preprocessed Image Fed to EasyOCR Engine</span>
+                            <span class="conf-badge conf-high">Enhanced Crop</span>
+                        </div>
+                        <div style="text-align: center; background: #000; border-radius: 8px; padding: 10px; border: 1px dashed rgba(255,255,255,0.15);">
+                            <img id="preprocessedCropImg" style="max-width: 100%; max-height: 180px; object-fit: contain; border-radius: 6px; box-shadow: 0 4px 12px rgba(0,0,0,0.6);" alt="Preprocessed EasyOCR Input Crop">
+                        </div>
+                    </div>
+
                     <!-- DETAILED WORD TABLE -->
                     <div>
                         <div style="font-size: 13px; font-weight: 600; color: var(--text-muted); margin-bottom: 8px;">
@@ -929,6 +940,13 @@ curl -X POST -F "file=@your_image.png" -F "languages=en" http://127.0.0.1:5000/a
 
                     if (data.annotated_image_base64) {
                         previewImg.src = data.annotated_image_base64;
+                    }
+
+                    if (data.preprocessed_image_base64) {
+                        document.getElementById('preprocessedCropImg').src = data.preprocessed_image_base64;
+                        document.getElementById('preprocessedCropContainer').style.display = 'block';
+                    } else {
+                        document.getElementById('preprocessedCropContainer').style.display = 'none';
                     }
 
                     // Calculate Metrics

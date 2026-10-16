@@ -31,6 +31,14 @@ if __name__ == "__main__":
         print("Detected Words Breakdown:")
         for idx, item in enumerate(result["results"], 1):
             print(f" {idx}. '{item['text']}' | Confidence: {item['confidence']*100:.1f}%")
-        print(f"\nAnnotated visualization generated successfully!")
+        
+        if "preprocessed_image_base64" in result:
+            import base64
+            img_b64 = result["preprocessed_image_base64"].split(",", 1)[1]
+            with open("sample_preprocessed_crop.png", "wb") as f:
+                f.write(base64.b64decode(img_b64))
+            print("\n[OK] EasyOCR Preprocessed Input Crop saved to: sample_preprocessed_crop.png")
+            
+        print(f"Annotated visualization generated successfully!")
     else:
         print(f"\n[ERROR] OCR Failed: {result.get('error')}")

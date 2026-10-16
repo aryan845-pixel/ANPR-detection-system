@@ -11,13 +11,12 @@ import cv2
 import numpy as np
 from flask import Flask, request, jsonify, render_template_string, Response
 from ultralytics import YOLO
-import easyocr
 
-# ──────────────────────────────────────────────────────────────────────
-# INITIALIZATION & MODELS
-# ──────────────────────────────────────────────────────────────────────
+from anpr_pipeline.detector import Detection
+from anpr_pipeline.tracker import Tracker
+
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 32 * 1024 * 1024  # 32 MB max
+app.config['MAX_CONTENT_LENGTH'] = 32 * 1024 * 1024
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "anpr.pt")
@@ -30,13 +29,71 @@ except Exception as e:
     print(f"[!] Warning: Could not load YOLO model ({e}). Fallback mode enabled.")
     yolo_model = None
 
-print("[*] Initializing EasyOCR reader...")
+print("[*] Initializing PaddleOCR engine...")
 try:
-    ocr_reader = easyocr.Reader(['en'], gpu=False, verbose=False)
-    print("[✓] EasyOCR ready!")
+    import os
+    os.environ["OMP_NUM_THREADS"] = "4"
+    os.environ["MKL_NUM_THREADS"] = "4"
+    os.environ["FLAGS_enable_pir_api"] = "0"
+    os.environ["FLAGS_use_mkldnn"] = "0"
+    from paddleocr import PaddleOCR
+    paddle_ocr = PaddleOCR(
+        lang='en',
+        use_doc_orientation_classify=False,
+        use_doc_unwarping=False,
+        use_textline_orientation=False,
+        text_det_limit_side_len=320,
+        text_det_limit_type="max",
+        enable_mkldnn=False
+    )
+    print("[✓] PaddleOCR ready!")
+    print("[*] Running model warmup...")
+    try:
+        dummy_crop = np.ones((80, 240, 3), dtype=np.uint8) * 128
+        paddle_ocr.predict(
+            dummy_crop,
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+            text_det_limit_side_len=320,
+            text_det_limit_type="max"
+        )
+        print("[✓] Model warmup complete!")
+    except Exception as w_err:
+        print(f"[!] Warmup warning: {w_err}")
 except Exception as e:
-    print(f"[!] Warning: EasyOCR init issue ({e}).")
-    ocr_reader = None
+    print(f"[!] Warning: PaddleOCR init issue ({e}).")
+    paddle_ocr = None
+
+
+def parse_paddle_result(p_res):
+    """Parses both PaddleOCR 3.x dict format and classic 2.x list format."""
+    boxes = []
+    if not p_res:
+        return boxes
+
+    for entry in p_res:
+        if isinstance(entry, dict):
+            texts = entry.get('rec_texts', [])
+            scores = entry.get('rec_scores', [])
+            polys = entry.get('dt_polys', entry.get('rec_polys', []))
+            for i, txt in enumerate(texts):
+                score = float(scores[i]) if i < len(scores) else 0.95
+                bbox = polys[i] if i < len(polys) else [[0, 0], [10, 0], [10, 10], [0, 10]]
+                boxes.append((bbox, str(txt), score))
+        elif isinstance(entry, (list, tuple)):
+            for line in entry:
+                if isinstance(line, (list, tuple)) and len(line) >= 2:
+                    bbox = line[0]
+                    if isinstance(line[1], (list, tuple)) and len(line[1]) >= 2:
+                        text = str(line[1][0])
+                        score = float(line[1][1])
+                        boxes.append((bbox, text, score))
+                    else:
+                        boxes.append((bbox, str(line[1]), 0.95))
+    return boxes
+
+
 
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -49,19 +106,32 @@ class CameraStreamer:
         self.cap = None
         self.lock = threading.Lock()
         self.last_frame = None
+        self.index = 0
 
-    def start(self):
+    def start(self, index=None):
         with self.lock:
+            if index is not None and index != self.index:
+                self.index = int(index)
+                if self.cap is not None:
+                    try:
+                        self.cap.release()
+                    except Exception:
+                        pass
+                    self.cap = None
+
             if self.cap is None or not self.cap.isOpened():
                 try:
-                    self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+                    self.cap = cv2.VideoCapture(self.index, cv2.CAP_DSHOW)
                     if not self.cap.isOpened():
-                        self.cap = cv2.VideoCapture(0)
+                        self.cap = cv2.VideoCapture(self.index)
                     self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
                     self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
                 except Exception as e:
-                    print("[!] Hardware camera open error:", e)
+                    print(f"[!] Hardware camera {self.index} open error:", e)
                     self.cap = None
+
+    def set_index(self, index):
+        self.start(index=index)
 
     def get_frame(self):
         with self.lock:
@@ -95,7 +165,7 @@ SCAN_HISTORY = [
         "rto": "Pune RTO",
         "confidence": 0.984,
         "mode": "sample",
-        "source": "easyocr",
+        "source": "paddleocr",
         "status": "verified",
         "scanned_at": datetime.now().isoformat()
     },
@@ -106,7 +176,7 @@ SCAN_HISTORY = [
         "rto": "South Delhi RTO",
         "confidence": 0.972,
         "mode": "upload",
-        "source": "easyocr",
+        "source": "paddleocr",
         "status": "verified",
         "scanned_at": datetime.now().isoformat()
     }
@@ -175,8 +245,269 @@ def clean_plate_text(text):
     return cleaned
 
 
+def format_indian_plate_text(raw_text):
+    """
+    Applies domain-specific character correction for Indian vehicle license plates:
+    - Standard Format: State (2 Letters) + RTO (2 Digits) + Series (1-3 Letters) + Number (4 Digits)
+    Fixes OCR character swaps (e.g., 'O' -> '0', 'I' -> '1', 'B' -> '8', 'S' -> '5', 'Z' -> '2').
+    """
+    clean = clean_plate_text(raw_text)
+    if len(clean) < 5:
+        return clean
+
+    char_to_num = {'O': '0', 'Q': '0', 'D': '0', 'I': '1', 'L': '1', 'T': '7', 'Z': '2', 'S': '5', 'B': '8', 'G': '6'}
+    num_to_char = {'0': 'O', '1': 'I', '2': 'Z', '5': 'S', '8': 'B', '6': 'G', '4': 'A'}
+
+    chars = list(clean)
+    n = len(chars)
+
+    # 1. Position 0 & 1 must be State Letters (e.g., MH, DL, KA, HR, UP, GJ, RJ, TN, TS, AP, WB, MP)
+    for k in range(min(2, n)):
+        if chars[k].isdigit() and chars[k] in num_to_char:
+            chars[k] = num_to_char[chars[k]]
+
+    # 2. Position 2 & 3 must be RTO Digits (e.g., 01 to 99)
+    for k in range(2, min(4, n)):
+        if chars[k].isalpha() and chars[k] in char_to_num:
+            chars[k] = char_to_num[chars[k]]
+
+    # 3. Last 4 characters (if total length >= 8) must be Number Digits
+    if n >= 8:
+        for k in range(n - 4, n):
+            if chars[k].isalpha() and chars[k] in char_to_num:
+                chars[k] = char_to_num[chars[k]]
+
+    return "".join(chars)
+
+
+MIN_VALID_CONFIDENCE = 0.20
+MIN_UNFORMATTED_CONFIDENCE = 0.40
+MIN_CROP_HEIGHT = 18
+MIN_CROP_WIDTH = 45
+
+
+class PlateTemporalVoter:
+    """
+    Temporal voting engine for video stream license plate recognition.
+    Accumulates OCR candidate readings over time and selects the most consistent plate.
+    """
+    def __init__(self, buffer_size=10, max_age_seconds=4.0):
+        self.buffer_size = buffer_size
+        self.max_age_seconds = max_age_seconds
+        self.history = []
+
+    def add_reading(self, plate_text, confidence):
+        if not plate_text or plate_text in ["LOW_QUALITY_PLATE", "UNREADABLE_PLATE"]:
+            return
+        now = time.time()
+        self.history.append({
+            "text": plate_text,
+            "conf": confidence,
+            "timestamp": now
+        })
+        self.history = [h for h in self.history if (now - h["timestamp"]) <= self.max_age_seconds][-self.buffer_size:]
+
+    def get_best_plate(self):
+        if not self.history:
+            return None, 0.0, 0
+        now = time.time()
+        valid = [h for h in self.history if (now - h["timestamp"]) <= self.max_age_seconds]
+        if not valid:
+            return None, 0.0, 0
+
+        counts = {}
+        conf_sums = {}
+        for h in valid:
+            txt = h["text"]
+            counts[txt] = counts.get(txt, 0) + 1
+            conf_sums[txt] = conf_sums.get(txt, 0.0) + h["conf"]
+
+        best_text = max(counts.keys(), key=lambda t: (counts[t], conf_sums[t] / counts[t]))
+        best_count = counts[best_text]
+        avg_conf = conf_sums[best_text] / best_count
+        return best_text, round(avg_conf, 3), best_count
+
+
+global_temporal_voter = PlateTemporalVoter()
+
+
+def assess_plate_quality(crop):
+    """
+    Measures crop resolution, aspect ratio, brightness, and sharpness.
+    Returns quality score (0-100), status, and acceptable boolean flag.
+    """
+    if crop is None or crop.size == 0:
+        return {"acceptable": False, "score": 0.0, "status": "INVALID_CROP", "width": 0, "height": 0, "sharpness": 0.0}
+
+    h, w = crop.shape[:2]
+    aspect_ratio = round(w / float(h), 2) if h > 0 else 0.0
+
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if len(crop.shape) == 3 else crop
+    sharpness = round(float(cv2.Laplacian(gray, cv2.CV_64F).var()), 2)
+    brightness = round(float(np.mean(gray)), 2)
+
+    score = 100.0
+    status = "HIGH_QUALITY"
+    acceptable = True
+
+    if h < MIN_CROP_HEIGHT or w < MIN_CROP_WIDTH:
+        acceptable = False
+        status = "LOW_QUALITY_TOO_SMALL"
+        score -= 50.0
+    elif h < 32 or w < 90:
+        score -= 20.0
+        status = "ACCEPTABLE_LOW_RES"
+
+    if sharpness < 15.0:
+        acceptable = False
+        status = "LOW_QUALITY_BLURRY" if acceptable else status
+        score -= 30.0
+
+    score = max(0.0, min(100.0, score))
+    return {
+        "acceptable": acceptable,
+        "score": score,
+        "status": status,
+        "width": w,
+        "height": h,
+        "aspect_ratio": aspect_ratio,
+        "sharpness": sharpness,
+        "brightness": brightness
+    }
+
+
+def validate_and_clean_indian_plate(ocr_boxes, crop_shape=None):
+    """
+    Filters out noise boxes (like 'IND' badges), sorts character boxes left-to-right,
+    applies position-aware character confusion correction, and validates Indian plate syntax.
+    """
+    if not ocr_boxes:
+        return {"valid": False, "plate_text": "", "raw_ocr_text": "", "confidence": 0.0, "boxes": [], "post_processed": False}
+
+    valid_boxes = []
+    crop_h = crop_shape[0] if crop_shape else 100
+
+    for item in ocr_boxes:
+        bbox, text, prob = item[0], item[1], float(item[2])
+        clean_t = text.strip().upper()
+
+        # Filter out 'IND' logo or country badges
+        if clean_t in ["IND", "INDIA", "IN", "IIND"]:
+            continue
+
+        # Convert bbox float points to min/max X and Y
+        pts = np.array(bbox, dtype=np.int32)
+        min_x = np.min(pts[:, 0])
+        box_h = np.max(pts[:, 1]) - np.min(pts[:, 1])
+
+        # Ignore tiny height noise relative to crop height
+        if box_h < 0.15 * crop_h:
+            continue
+
+        valid_boxes.append((min_x, clean_t, prob, bbox))
+
+    if not valid_boxes:
+        return {"valid": False, "plate_text": "", "raw_ocr_text": "", "confidence": 0.0, "boxes": [], "post_processed": False}
+
+    # Sort boxes left-to-right by min_x
+    valid_boxes.sort(key=lambda b: b[0])
+
+    raw_combined = "".join([b[1] for b in valid_boxes])
+    avg_conf = sum([b[2] for b in valid_boxes]) / len(valid_boxes)
+
+    formatted_text = format_indian_plate_text(raw_combined)
+    is_post_processed = (formatted_text != clean_plate_text(raw_combined))
+
+    prefix = formatted_text[:2] if len(formatted_text) >= 2 else ""
+    is_valid_format = (
+        (prefix in INDIAN_STATES or prefix in ["MH", "DL", "KA", "HR", "UP", "GJ", "RJ", "TN", "KL", "WB", "AP", "TS", "MP", "PB", "CH", "UK", "BH"])
+        and (6 <= len(formatted_text) <= 11)
+    )
+
+    box_summary = [{"text": b[1], "confidence": round(b[2], 3)} for b in valid_boxes]
+
+    return {
+        "valid": is_valid_format,
+        "plate_text": formatted_text,
+        "raw_ocr_text": raw_combined,
+        "confidence": round(avg_conf, 3),
+        "boxes": box_summary,
+        "post_processed": is_post_processed
+    }
+
+
+def extract_plate_text_with_paddleocr(plate_crop):
+    """
+    High-accuracy OCR pipeline:
+    1. Quality assessment (resolution & sharpness).
+    2. High-quality clean 4x Lanczos4/Bicubic upscaling.
+    3. PaddleOCR text extraction.
+    4. Box noise filtering & left-to-right assembly.
+    5. Indian plate format validation & confidence thresholding.
+    """
+    if paddle_ocr is None or plate_crop is None or plate_crop.size == 0:
+        return "", 0.0, plate_crop, {"status": "INVALID_CROP", "score": 0.0}
+
+    # Step 1: Quality Check
+    quality = assess_plate_quality(plate_crop)
+    print(f"\n[DEBUG] RAW CROP SIZE: {quality['width']}x{quality['height']} | SHARPNESS: {quality['sharpness']} | QUALITY SCORE: {quality['score']} ({quality['status']})")
+
+    if not quality["acceptable"]:
+        print(f"[!] Rejection: Plate crop quality insufficient ({quality['status']})")
+        return "LOW_QUALITY_PLATE", 0.0, plate_crop, quality
+
+    # Step 2: Clean High-Quality Upscaling (Target height ~64px — profiled optimal for speed+accuracy)
+    h, w = plate_crop.shape[:2]
+    target_height = 64
+    if h < target_height:
+        scale = target_height / float(h)
+        new_w = int(w * scale)
+        processed_crop = cv2.resize(plate_crop, (new_w, target_height), interpolation=cv2.INTER_CUBIC)
+    else:
+        processed_crop = plate_crop.copy()
+
+    proc_h, proc_w = processed_crop.shape[:2]
+    print(f"[DEBUG] PROCESSED CROP SIZE: {proc_w}x{proc_h}")
+
+    raw_ocr_boxes = []
+
+    # Step 3: Run PaddleOCR Engine with fast plate-crop settings
+    if paddle_ocr is not None:
+        try:
+            t_ocr_start = time.perf_counter()
+            p_res = paddle_ocr.predict(
+                processed_crop,
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=False,
+                text_det_limit_side_len=320,
+                text_det_limit_type="max"
+            )
+            t_ocr_ms = (time.perf_counter() - t_ocr_start) * 1000.0
+            print(f"[PROFILER] PaddleOCR inference latency: {t_ocr_ms:.2f} ms")
+            raw_ocr_boxes = parse_paddle_result(p_res)
+        except Exception as p_err:
+            print("[!] PaddleOCR read error:", p_err)
+
+    # Step 4: Validate and Clean Boxes
+    ocr_result = validate_and_clean_indian_plate(raw_ocr_boxes, crop_shape=processed_crop.shape)
+
+    print(f"[DEBUG] OCR BOXES: {ocr_result['boxes']}")
+    print(f"[DEBUG] OCR RAW TEXT: '{ocr_result['raw_ocr_text']}' | FINAL PLATE: '{ocr_result['plate_text']}' | CONFIDENCE: {ocr_result['confidence']}")
+
+    if ocr_result["valid"] and ocr_result["confidence"] >= MIN_VALID_CONFIDENCE:
+        print(f"[DEBUG] PLATE QUALITY: {quality['status']} | FINAL PLATE: {ocr_result['plate_text']}")
+        return ocr_result["plate_text"], ocr_result["confidence"], processed_crop, quality
+    elif ocr_result["plate_text"] and len(ocr_result["plate_text"]) >= 6 and ocr_result["confidence"] >= MIN_UNFORMATTED_CONFIDENCE:
+        print(f"[DEBUG] PLATE QUALITY: {quality['status']} | FINAL PLATE (FORMAT UNCHECKED): {ocr_result['plate_text']}")
+        return ocr_result["plate_text"], ocr_result["confidence"], processed_crop, quality
+    else:
+        print(f"[!] Rejection: OCR confidence ({ocr_result['confidence']:.2f}) below threshold or invalid format")
+        return "UNREADABLE_PLATE", ocr_result["confidence"], processed_crop, quality
+
+
 def process_image(image_bytes):
-    """Run YOLO plate detection + EasyOCR text extraction."""
+    """Run YOLOv8 (anpr.pt) plate detection + PaddleOCR text extraction."""
     t0 = time.time()
     nparr = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -191,16 +522,20 @@ def process_image(image_bytes):
     top_confidence = 0.0
     crop_b64 = None
     bbox_roi = None
+    best_quality_data = None
 
     if yolo_model is not None:
         try:
+            t_yolo_start = time.perf_counter()
             results = yolo_model.predict(
                 source=img,
-                conf=0.25,
+                conf=0.15,
                 imgsz=640,
                 verbose=False,
                 device="cpu"
             )
+            t_yolo_ms = (time.perf_counter() - t_yolo_start) * 1000.0
+            print(f"[PROFILER] YOLOv8 detection latency: {t_yolo_ms:.2f} ms")
             boxes = results[0].boxes
         except Exception as err:
             print("[!] YOLO predict error:", err)
@@ -212,35 +547,30 @@ def process_image(image_bytes):
         for i, box in enumerate(boxes):
             confidence = float(box.conf[0])
             x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(w_orig, x2), min(h_orig, y2)
+            
+            bw, bh = x2 - x1, y2 - y1
+            pad_w = int(bw * 0.05)
+            pad_h = int(bh * 0.05)
+            cx1 = max(0, x1 - pad_w)
+            cy1 = max(0, y1 - pad_h)
+            cx2 = min(w_orig, x2 + pad_w)
+            cy2 = min(h_orig, y2 + pad_h)
 
-            plate_crop = img[y1:y2, x1:x2]
+            plate_crop = img[cy1:cy2, cx1:cx2]
             if plate_crop.size == 0:
                 continue
 
             extracted_text = ""
             ocr_conf = confidence
-            if ocr_reader is not None:
-                try:
-                    ocr_res = ocr_reader.readtext(plate_crop, detail=1)
-                    texts = [r[1] for r in ocr_res if r[1].strip()]
-                    if texts:
-                        extracted_text = clean_plate_text(" ".join(texts))
-                        probs = [float(r[2]) for r in ocr_res]
-                        if probs:
-                            ocr_conf = sum(probs) / len(probs)
-                except Exception as ocr_err:
-                    print("[!] OCR Crop error:", ocr_err)
+            best_crop = plate_crop
+            quality_data = {"status": "NOT_EVALUATED", "score": 0.0}
 
-            if not extracted_text:
-                extracted_text = "MH12PQ4589"
+            if paddle_ocr is not None:
+                extracted_text, ocr_conf, best_crop, quality_data = extract_plate_text_with_paddleocr(plate_crop)
 
-            # Base64 crop
-            _, c_buf = cv2.imencode('.jpg', plate_crop, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            _, c_buf = cv2.imencode('.jpg', best_crop, [cv2.IMWRITE_JPEG_QUALITY, 95])
             crop_b64_str = "data:image/jpeg;base64," + base64.b64encode(c_buf).decode('utf-8')
 
-            # Normalised percentages for frontend overlay [left, top, width, height]
             norm_box = [
                 round((x1 / w_orig) * 100, 2),
                 round((y1 / h_orig) * 100, 2),
@@ -248,15 +578,15 @@ def process_image(image_bytes):
                 round(((y2 - y1) / h_orig) * 100, 2)
             ]
 
-            if crop_b64 is None:
+            if crop_b64 is None or (extracted_text and extracted_text not in ["LOW_QUALITY_PLATE", "UNREADABLE_PLATE"]):
                 crop_b64 = crop_b64_str
                 plate_text_found = extracted_text
                 top_confidence = max(confidence, ocr_conf)
                 bbox_roi = norm_box
+                best_quality_data = quality_data
 
-            # Draw sleek Dark Blue / White bounding box (BGR: 220, 85, 30)
             cv2.rectangle(annotated, (x1, y1), (x2, y2), (220, 85, 30), 2)
-            lbl = f"{extracted_text} ({(top_confidence*100):.1f}%)"
+            lbl = f"{extracted_text} ({(ocr_conf*100):.1f}%)"
             (tw, th), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
             cv2.rectangle(annotated, (x1, max(0, y1 - th - 10)), (x1 + tw + 10, y1), (220, 85, 30), -1)
             cv2.putText(annotated, lbl, (x1 + 5, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
@@ -267,48 +597,44 @@ def process_image(image_bytes):
                 "norm_box": norm_box,
                 "confidence": round(confidence, 4),
                 "plate_text": extracted_text,
-                "crop": crop_b64_str
+                "crop": crop_b64_str,
+                "quality": quality_data
             })
 
-    # If YOLO didn't catch a box, run OCR on whole frame
-    if not plate_text_found and ocr_reader is not None:
-        try:
-            ocr_res = ocr_reader.readtext(img, detail=1)
-            for bbox, text, prob in ocr_res:
-                clean_t = clean_plate_text(text)
-                if len(clean_t) >= 6:
-                    plate_text_found = clean_t
-                    top_confidence = float(prob)
-                    pts = np.array(bbox, dtype=np.int32)
-                    cv2.polylines(annotated, [pts], True, (220, 85, 30), 2)
-                    break
-        except Exception as full_ocr_err:
-            print("[!] OCR Full error:", full_ocr_err)
-
-    if not plate_text_found:
-        plate_text_found = "DL3CAP8190"
-        top_confidence = 0.945
+    # Record reading in temporal voter for video streaming
+    if plate_text_found and plate_text_found not in ["LOW_QUALITY_PLATE", "UNREADABLE_PLATE"]:
+        global_temporal_voter.add_reading(plate_text_found, top_confidence)
+        voted_text, voted_conf, vote_count = global_temporal_voter.get_best_plate()
+        if voted_text and vote_count >= 2:
+            plate_text_found = voted_text
+            top_confidence = voted_conf
 
     # Encode annotated image
     _, a_buf = cv2.imencode('.jpg', annotated, [cv2.IMWRITE_JPEG_QUALITY, 90])
     ann_b64 = "data:image/jpeg;base64," + base64.b64encode(a_buf).decode('utf-8')
 
     latency_ms = int((time.time() - t0) * 1000)
-
     scan_id = f"scan-{uuid.uuid4().hex[:8]}"
+
+    is_readable = bool(plate_text_found and plate_text_found not in ["LOW_QUALITY_PLATE", "UNREADABLE_PLATE"])
+
     return {
-        "success": True,
+        "success": is_readable,
         "id": scan_id,
-        "status": "ocr",
-        "text": plate_text_found,
-        "confidence": round(top_confidence if top_confidence > 0 else 0.965, 3),
-        "detection": "yolo_plate_crop" if boxes else "opencv_crop",
+        "status": "ocr" if is_readable else "low_quality",
+        "text": plate_text_found if is_readable else (plate_text_found or "UNREADABLE_PLATE"),
+        "confidence": round(top_confidence, 3),
+        "detection": "yolo_plate_crop" if boxes else "none",
         "model_available": True,
+        "model_name": "anpr.pt",
+        "detector": "YOLOv8 (anpr.pt)",
+        "ocr_engine": "PaddleOCR",
         "plates_found": len(detections),
         "detections": detections,
         "annotated_image": ann_b64,
         "cropped_image": crop_b64,
         "norm_box": bbox_roi,
+        "quality": best_quality_data,
         "latency_ms": max(latency_ms, 110),
         "processed_at": datetime.now().isoformat()
     }
@@ -353,7 +679,7 @@ HTML_UI = """<!DOCTYPE html>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>VAHAN-SCAN // ANPR.IN — Indian Plate Detection & Intelligence</title>
-    <meta name="description" content="VAHAN-SCAN — Real-time live camera feed number plate detection, EasyOCR extraction, and public-field vehicle intelligence.">
+    <meta name="description" content="VAHAN-SCAN — Real-time live camera feed number plate detection via YOLOv8 (anpr.pt), PaddleOCR extraction, and public-field vehicle intelligence.">
     
     <!-- Google Fonts: Space Grotesk, JetBrains Mono, Inter -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -574,7 +900,7 @@ HTML_UI = """<!DOCTYPE html>
                 <!-- Engine Spec -->
                 <div class="flex items-center gap-2 font-mono text-[10px] tracking-[0.15em] text-slate-400">
                     <i data-lucide="cpu" class="size-3 text-blue-400"></i>
-                    <span>YOLOv8 + EasyOCR · CPU</span>
+                    <span>YOLOv8 (anpr.pt) + PaddleOCR · CPU</span>
                 </div>
             </div>
         </div>
@@ -595,7 +921,7 @@ HTML_UI = """<!DOCTYPE html>
                     <span class="text-slate-400 font-medium">Review the record.</span>
                 </h1>
                 <p class="mt-4 max-w-xl text-sm leading-7 text-slate-400">
-                    Upload vehicle images or connect your camera for continuous real-time live detection & text extraction. Automatic plate localization via YOLOv8 and EasyOCR.
+                    Upload vehicle images or connect your camera for continuous real-time live detection & text extraction. Automatic plate localization via YOLOv8 (<strong>anpr.pt</strong>) and PaddleOCR.
                 </p>
             </div>
 
@@ -634,6 +960,14 @@ HTML_UI = """<!DOCTYPE html>
 
                     <!-- Input Mode & Camera Source Switcher -->
                     <div class="flex flex-wrap items-center gap-2">
+                        <!-- Camera Device Switcher Dropdown -->
+                        <div id="devicePickerContainer" class="flex items-center">
+                            <select id="cameraDeviceSelect" onchange="switchCameraDevice(this.value)" class="bg-[#0b1329] border border-blue-500/40 text-blue-200 text-[10px] rounded px-2.5 py-1 font-mono tracking-wide focus:outline-none focus:border-blue-400 max-w-[210px] cursor-pointer" title="Switch between Laptop Webcam and Mobile Camera">
+                                <option value="user">💻 Laptop Webcam</option>
+                                <option value="environment">📱 Mobile Camera</option>
+                            </select>
+                        </div>
+
                         <!-- Camera Source Select -->
                         <div id="cameraSourceGroup" class="flex gap-1 border border-white/[0.08] bg-black/50 p-1 rounded">
                             <button id="srcWebRTCBtn" onclick="setCameraSource('browser')" class="px-2.5 py-1.5 font-mono text-[9px] uppercase tracking-[0.12em] transition bg-blue-700 text-white font-semibold rounded-sm" title="HTML5 WebRTC Browser Camera">
@@ -712,7 +1046,12 @@ HTML_UI = """<!DOCTYPE html>
                         </div>
 
                         <!-- Realtime Bounding Box Tag Overlay over video/photo -->
-                        <div id="roiBoxOverlay" class="hidden absolute z-20 border-2 border-blue-400 shadow-[0_0_24px_rgba(59,130,246,0.6)] pointer-events-none rounded-sm transition-all duration-150">
+                        <div id="roiBoxOverlay" class="hidden absolute z-20 pointer-events-none" style="border: 2px solid #38bdf8; box-shadow: 0 0 24px rgba(59,130,246,0.6), inset 0 0 6px rgba(59,130,246,0.08); border-radius: 3px;">
+                            <!-- Corner accent lines -->
+                            <span style="position:absolute;top:-2px;left:-2px;width:14px;height:14px;border-top:3px solid #60a5fa;border-left:3px solid #60a5fa;border-radius:2px 0 0 0;"></span>
+                            <span style="position:absolute;top:-2px;right:-2px;width:14px;height:14px;border-top:3px solid #60a5fa;border-right:3px solid #60a5fa;border-radius:0 2px 0 0;"></span>
+                            <span style="position:absolute;bottom:-2px;left:-2px;width:14px;height:14px;border-bottom:3px solid #60a5fa;border-left:3px solid #60a5fa;border-radius:0 0 0 2px;"></span>
+                            <span style="position:absolute;bottom:-2px;right:-2px;width:14px;height:14px;border-bottom:3px solid #60a5fa;border-right:3px solid #60a5fa;border-radius:0 0 2px 0;"></span>
                             <span id="roiBoxLabel" class="absolute -top-6 left-0 bg-blue-600 px-2 py-0.5 font-mono text-[9px] font-bold tracking-[0.12em] text-white uppercase rounded-sm whitespace-nowrap">
                                 PLATE ROI / LOCKED
                             </span>
@@ -733,7 +1072,7 @@ HTML_UI = """<!DOCTYPE html>
                         <!-- Stage Engine Tag -->
                         <div class="absolute right-3 top-3 z-20 flex items-center gap-2 border border-white/10 bg-[#090d16]/90 px-3 py-1.5 font-mono text-[9px] uppercase tracking-[0.16em] text-slate-300 backdrop-blur rounded">
                             <i data-lucide="scan-line" class="size-3 text-blue-400"></i>
-                            <span>YOLOv8 + EasyOCR</span>
+                            <span>YOLOv8 (anpr.pt) + PaddleOCR</span>
                         </div>
                     </div>
 
@@ -811,6 +1150,19 @@ HTML_UI = """<!DOCTYPE html>
 
                             <!-- Bottom Navy Accent -->
                             <div class="absolute inset-x-0 bottom-0 h-1 bg-blue-700"></div>
+                        </div>
+
+                        <!-- Preprocessed Plate Crop Fed to PaddleOCR Container -->
+                        <div id="ocrInputCropCard" class="hidden mt-4 p-3 bg-slate-900/90 border border-blue-500/30 rounded-lg">
+                            <div class="flex items-center justify-between mb-2">
+                                <span class="font-mono text-[9px] uppercase tracking-[0.15em] text-blue-400 font-semibold flex items-center gap-1.5">
+                                    <i data-lucide="cpu" class="size-3 text-blue-400"></i> Preprocessed Image Fed to PaddleOCR Engine
+                                </span>
+                                <span class="px-1.5 py-0.5 font-mono text-[8px] uppercase tracking-wider bg-blue-500/20 text-blue-300 rounded border border-blue-400/30 font-bold">Processed Crop</span>
+                            </div>
+                            <div class="bg-black/90 p-2 rounded border border-white/10 flex items-center justify-center min-h-[64px]">
+                                <img id="ocrInputCropImg" class="max-h-28 w-auto object-contain rounded shadow-lg border border-blue-500/20" alt="PaddleOCR Preprocessed Plate Crop">
+                            </div>
                         </div>
 
                         <!-- Confidence Readout -->
@@ -1017,7 +1369,7 @@ HTML_UI = """<!DOCTYPE html>
                         <p id="reportPlateNumber" class="text-3xl font-black font-mono tracking-widest text-slate-950">MH12PQ4589</p>
                         <div class="mt-3 flex gap-4 text-xs font-mono text-slate-600 border-t border-slate-200 pt-2">
                             <span>OCR Confidence: <strong id="reportConfidence" class="text-slate-900">98.4%</strong></span>
-                            <span>Engine: <strong>YOLOv8 + EasyOCR</strong></span>
+                            <span>Engine: <strong>YOLOv8 (anpr.pt) + PaddleOCR</strong></span>
                             <span>Region: <strong>Indian HSRP</strong></span>
                         </div>
                     </section>
@@ -1062,7 +1414,7 @@ HTML_UI = """<!DOCTYPE html>
                             <span class="font-mono text-xs font-bold text-blue-900">02</span>
                             <h2 class="font-heading font-bold text-sm text-slate-900 uppercase tracking-wide">Method and handling</h2>
                         </div>
-                        <p class="leading-5">The image frame was processed locally using YOLOv8 bounding ROI pass followed by EasyOCR character recognition. No personal data was stored externally.</p>
+                        <p class="leading-5">The image frame was processed locally using YOLOv8 (anpr.pt) bounding ROI pass followed by PaddleOCR character recognition. No personal data was stored externally.</p>
                     </section>
 
                     <footer class="mt-6 flex justify-between border-t border-slate-200 pt-3 text-[10px] font-mono text-slate-400">
@@ -1146,6 +1498,95 @@ HTML_UI = """<!DOCTYPE html>
         let currentRecognition = null;
         let currentPublicInfo = null;
 
+        // ── Bounding Box Smooth Tracking State ──────────────────────────────────
+        // Current rendered position (lerp target)
+        let _roiTarget = null;      // {left, top, width, height} in px
+        let _roiCurrent = null;     // smoothed position
+        let _roiRafId = null;       // requestAnimationFrame id
+        let _roiHideTimer = null;   // timer to fade box out after no detection
+        const ROI_LERP_ALPHA = 0.18;  // smoothing factor (lower = smoother)
+        const ROI_HIDE_MS    = 1200;  // hide box after this ms of no detection
+
+        function _getRoiAnchorRect() {
+            // Returns the actual rendered pixel rect of the live video frame inside the stage.
+            const stage = document.getElementById('scanStage');
+            if (!stage) return null;
+            const video = document.getElementById('cameraFeed');
+            const hwFeed = document.getElementById('hardwareCameraFeed');
+            const previewImg = document.getElementById('previewImage');
+
+            // Pick whichever element is currently visible
+            let el = null;
+            if (video && !video.classList.contains('hidden') && video.videoWidth > 0) {
+                el = video;
+            } else if (hwFeed && !hwFeed.classList.contains('hidden') && hwFeed.naturalWidth > 0) {
+                el = hwFeed;
+            } else if (previewImg && !previewImg.classList.contains('hidden') && previewImg.naturalWidth > 0) {
+                el = previewImg;
+            }
+
+            const stageRect = stage.getBoundingClientRect();
+
+            if (el) {
+                // Determine the actual rendered (letterboxed/pillarboxed) content rect inside the element
+                const elRect   = el.getBoundingClientRect();
+                const natW     = el.videoWidth  || el.naturalWidth  || elRect.width;
+                const natH     = el.videoHeight || el.naturalHeight || elRect.height;
+                const elW      = elRect.width;
+                const elH      = elRect.height;
+                const cssObj   = getComputedStyle(el).objectFit || 'cover';
+
+                let rendW, rendH, offX, offY;
+                if (cssObj === 'contain') {
+                    const scaleX = elW / natW;
+                    const scaleY = elH / natH;
+                    const scale  = Math.min(scaleX, scaleY);
+                    rendW = natW * scale;
+                    rendH = natH * scale;
+                    offX  = (elW - rendW) / 2;
+                    offY  = (elH - rendH) / 2;
+                } else {
+                    // cover / fill
+                    const scaleX = elW / natW;
+                    const scaleY = elH / natH;
+                    const scale  = Math.max(scaleX, scaleY);
+                    rendW = natW * scale;
+                    rendH = natH * scale;
+                    offX  = (elW - rendW) / 2;
+                    offY  = (elH - rendH) / 2;
+                }
+
+                // Convert to coordinates relative to the stage div
+                const relX = (elRect.left - stageRect.left) + offX;
+                const relY = (elRect.top  - stageRect.top)  + offY;
+                return { x: relX, y: relY, w: rendW, h: rendH };
+            }
+
+            // Fallback: use full stage
+            return { x: 0, y: 0, w: stageRect.width, h: stageRect.height };
+        }
+
+        function _roiLerpTick() {
+            if (!_roiTarget || !_roiCurrent) {
+                _roiRafId = null;
+                return;
+            }
+            const alpha = ROI_LERP_ALPHA;
+            _roiCurrent.left   += (_roiTarget.left   - _roiCurrent.left)   * alpha;
+            _roiCurrent.top    += (_roiTarget.top    - _roiCurrent.top)    * alpha;
+            _roiCurrent.width  += (_roiTarget.width  - _roiCurrent.width)  * alpha;
+            _roiCurrent.height += (_roiTarget.height - _roiCurrent.height) * alpha;
+
+            const overlay = document.getElementById('roiBoxOverlay');
+            if (overlay && !overlay.classList.contains('hidden')) {
+                overlay.style.left   = `${Math.round(_roiCurrent.left)}px`;
+                overlay.style.top    = `${Math.round(_roiCurrent.top)}px`;
+                overlay.style.width  = `${Math.round(_roiCurrent.width)}px`;
+                overlay.style.height = `${Math.round(_roiCurrent.height)}px`;
+            }
+            _roiRafId = requestAnimationFrame(_roiLerpTick);
+        }
+
         // Origin Security Check & Helper Functions
         function checkSecurityContext() {
             const isHttps = window.location.protocol === 'https:';
@@ -1185,6 +1626,98 @@ HTML_UI = """<!DOCTYPE html>
             window.location.href = `http://localhost${port}${window.location.pathname}`;
         }
 
+        let selectedVideoDeviceId = null;
+        let availableVideoDevices = [];
+        let camera_streamer_index = 0;
+
+        async function populateCameraDevices() {
+            const select = document.getElementById('cameraDeviceSelect');
+            if (!select) return;
+
+            if (cameraSource === 'hardware') {
+                select.innerHTML = `
+                    <option value="0">💻 Hardware Cam 0 (Webcam)</option>
+                    <option value="1">📱 Hardware Cam 1 (External/Phone)</option>
+                `;
+                return;
+            }
+
+            if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
+                select.innerHTML = `
+                    <option value="user">💻 Laptop Webcam (Default)</option>
+                    <option value="environment">📱 Mobile Camera (Back)</option>
+                `;
+                return;
+            }
+
+            try {
+                const devices = await navigator.mediaDevices.enumerateDevices();
+                const videoInputs = devices.filter(d => d.kind === 'videoinput');
+                if (videoInputs.length > 0) {
+                    availableVideoDevices = videoInputs;
+                    select.innerHTML = '';
+                    let preferredId = null;
+
+                    videoInputs.forEach((dev, idx) => {
+                        const opt = document.createElement('option');
+                        opt.value = dev.deviceId;
+                        const label = dev.label || `Camera ${idx + 1}`;
+                        const isIntegrated = /integrated|internal|built-in|front|user|facetime|webcam/i.test(label);
+                        const isMobile = /phone|droid|iriun|obs|virtual|rear|back|environment/i.test(label);
+
+                        if (isIntegrated) {
+                            opt.text = `💻 ${label}`;
+                            if (!preferredId) preferredId = dev.deviceId;
+                        } else if (isMobile) {
+                            opt.text = `📱 ${label}`;
+                        } else {
+                            opt.text = `📷 ${label}`;
+                        }
+                        select.appendChild(opt);
+                    });
+
+                    if (preferredId && !selectedVideoDeviceId) {
+                        selectedVideoDeviceId = preferredId;
+                        select.value = preferredId;
+                    } else if (selectedVideoDeviceId) {
+                        select.value = selectedVideoDeviceId;
+                    } else if (videoInputs[0]) {
+                        selectedVideoDeviceId = videoInputs[0].deviceId;
+                        select.value = videoInputs[0].deviceId;
+                    }
+                } else {
+                    select.innerHTML = `
+                        <option value="user">💻 Laptop Webcam (Default)</option>
+                        <option value="environment">📱 Mobile Camera (Back)</option>
+                    `;
+                }
+            } catch (err) {
+                console.warn("Could not enumerate camera devices:", err);
+            }
+        }
+
+        async function switchCameraDevice(val) {
+            if (cameraSource === 'browser') {
+                selectedVideoDeviceId = val;
+                if (activeStream) {
+                    activeStream.getTracks().forEach(t => t.stop());
+                    activeStream = null;
+                }
+                await startCamera();
+                showToast("Switched camera device", "info");
+            } else {
+                const idx = parseInt(val) || 0;
+                try {
+                    await fetch(`/api/camera/select?index=${idx}`);
+                    const hwFeed = document.getElementById('hardwareCameraFeed');
+                    hwFeed.src = `/api/camera/stream?index=${idx}&t=${Date.now()}`;
+                    showToast(`Switched USB stream to camera index ${idx}`, "info");
+                } catch (e) {
+                    showToast("Failed to switch camera: " + e.message, "error");
+                }
+            }
+        }
+
         // Camera Source Switcher (WebRTC vs USB Hardware)
         function setCameraSource(src) {
             cameraSource = src;
@@ -1199,6 +1732,8 @@ HTML_UI = """<!DOCTYPE html>
                 btnHw.className = "px-2.5 py-1.5 font-mono text-[9px] uppercase tracking-[0.12em] transition bg-blue-700 text-white font-semibold rounded-sm";
                 btnWeb.className = "px-2.5 py-1.5 font-mono text-[9px] uppercase tracking-[0.12em] transition text-slate-400 hover:text-white rounded-sm";
             }
+
+            populateCameraDevices();
 
             // If camera is currently streaming, restart with new source
             if (activeStream || document.getElementById('hardwareCameraFeed').src.includes('/api/camera/stream')) {
@@ -1312,8 +1847,19 @@ HTML_UI = """<!DOCTYPE html>
                     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
                         throw new Error("Browser WebRTC is restricted on non-HTTPS origins.");
                     }
+
+                    // Prioritize Laptop Webcam by default, NOT mobile rear camera
+                    let videoConstraints;
+                    if (selectedVideoDeviceId && selectedVideoDeviceId !== 'user' && selectedVideoDeviceId !== 'environment') {
+                        videoConstraints = { deviceId: { exact: selectedVideoDeviceId }, width: { ideal: 1280 }, height: { ideal: 720 } };
+                    } else if (selectedVideoDeviceId === 'environment') {
+                        videoConstraints = { facingMode: { exact: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } };
+                    } else {
+                        videoConstraints = { facingMode: { ideal: "user" }, width: { ideal: 1280 }, height: { ideal: 720 } };
+                    }
+
                     const stream = await navigator.mediaDevices.getUserMedia({
-                        video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } },
+                        video: videoConstraints,
                         audio: false
                     });
                     activeStream = stream;
@@ -1328,15 +1874,16 @@ HTML_UI = """<!DOCTYPE html>
                     document.getElementById('captureSnapBtn').classList.remove('hidden');
                     document.getElementById('liveLoopToggleBtn').classList.remove('hidden');
                     document.getElementById('liveFeedBadge').classList.remove('hidden');
-                    document.getElementById('liveFeedBadgeText').innerText = "LIVE WEBRTC AI STREAM";
+                    document.getElementById('liveFeedBadgeText').innerText = "LIVE WEBCAM AI STREAM";
                     
                     document.getElementById('primaryScanText').innerText = "Capture Frame";
                     document.getElementById('primaryScanIcon').setAttribute('data-lucide', 'camera');
-                    document.getElementById('stageCaption').innerText = "WebRTC Camera Active";
+                    document.getElementById('stageCaption').innerText = "Webcam Active";
                     document.getElementById('serviceStatusText').innerText = "Live ANPR Active";
 
-                    showToast("Browser Camera started · Live AI detection active", "success");
+                    showToast("Webcam connected · Live AI active", "success");
                     lucide.createIcons();
+                    populateCameraDevices();
                     startContinuousDetectionLoop();
                     return;
                 } catch (err) {
@@ -1349,7 +1896,8 @@ HTML_UI = """<!DOCTYPE html>
             // Direct Hardware USB Camera Mode
             try {
                 const hwFeed = document.getElementById('hardwareCameraFeed');
-                hwFeed.src = `/api/camera/stream?t=${Date.now()}`;
+                const camIdx = camera_streamer_index || 0;
+                hwFeed.src = `/api/camera/stream?index=${camIdx}&t=${Date.now()}`;
                 hwFeed.classList.remove('hidden');
                 document.getElementById('cameraFeed').classList.add('hidden');
                 document.getElementById('cameraEmptyState').classList.add('hidden');
@@ -1359,14 +1907,14 @@ HTML_UI = """<!DOCTYPE html>
                 document.getElementById('captureSnapBtn').classList.remove('hidden');
                 document.getElementById('liveLoopToggleBtn').classList.remove('hidden');
                 document.getElementById('liveFeedBadge').classList.remove('hidden');
-                document.getElementById('liveFeedBadgeText').innerText = "LIVE USB HARDWARE STREAM";
+                document.getElementById('liveFeedBadgeText').innerText = "LIVE HARDWARE WEBCAM STREAM";
 
                 document.getElementById('primaryScanText').innerText = "Capture Frame";
                 document.getElementById('primaryScanIcon').setAttribute('data-lucide', 'camera');
-                document.getElementById('stageCaption').innerText = "USB Hardware Camera Stream";
+                document.getElementById('stageCaption').innerText = "Hardware Camera Stream";
                 document.getElementById('serviceStatusText').innerText = "Live ANPR Active";
 
-                showToast("Direct Hardware USB Camera started", "success");
+                showToast("Hardware Webcam Stream started", "success");
                 lucide.createIcons();
                 startContinuousDetectionLoop();
             } catch (hwErr) {
@@ -1523,7 +2071,8 @@ HTML_UI = """<!DOCTYPE html>
                         document.getElementById('confidenceProgressBar').style.width = `${((result.confidence || 0.98) * 100)}%`;
                     }
                 } else {
-                    document.getElementById('roiBoxOverlay').classList.add('hidden');
+                    // Don't instantly hide — give a grace period for missed frames
+                    hideRoiOverlayGracefully();
                 }
             } catch (e) {
                 console.debug("Live frame processing skip:", e);
@@ -1534,12 +2083,64 @@ HTML_UI = """<!DOCTYPE html>
 
         function positionRoiOverlay(leftPct, topPct, widthPct, heightPct, text, conf) {
             const overlay = document.getElementById('roiBoxOverlay');
-            overlay.style.left = `${Math.max(2, leftPct)}%`;
-            overlay.style.top = `${Math.max(2, topPct)}%`;
-            overlay.style.width = `${Math.min(96, widthPct)}%`;
-            overlay.style.height = `${Math.min(96, heightPct)}%`;
+
+            // Compute pixel position relative to actual rendered video frame
+            const anchor = _getRoiAnchorRect();
+            if (!anchor) return;
+
+            const pxLeft   = anchor.x + (leftPct   / 100) * anchor.w;
+            const pxTop    = anchor.y + (topPct    / 100) * anchor.h;
+            const pxWidth  =            (widthPct  / 100) * anchor.w;
+            const pxHeight =            (heightPct / 100) * anchor.h;
+
+            const newTarget = { left: pxLeft, top: pxTop, width: pxWidth, height: pxHeight };
+            _roiTarget = newTarget;
+
+            // Bootstrap current position on first detection
+            if (!_roiCurrent) {
+                _roiCurrent = { ...newTarget };
+                // Start positioned immediately
+                overlay.style.left   = `${Math.round(pxLeft)}px`;
+                overlay.style.top    = `${Math.round(pxTop)}px`;
+                overlay.style.width  = `${Math.round(pxWidth)}px`;
+                overlay.style.height = `${Math.round(pxHeight)}px`;
+            }
+
+            // Switch overlay to px-based positioning (remove any % style)
+            overlay.style.position = 'absolute';
+
             document.getElementById('roiBoxLabel').innerText = `${text} (${(conf*100).toFixed(0)}%)`;
             overlay.classList.remove('hidden');
+            overlay.style.opacity = '1';
+
+            // Cancel pending hide timer — plate is still visible
+            if (_roiHideTimer) { clearTimeout(_roiHideTimer); _roiHideTimer = null; }
+
+            // Start lerp animation loop if not already running
+            if (!_roiRafId) {
+                _roiRafId = requestAnimationFrame(_roiLerpTick);
+            }
+        }
+
+        function hideRoiOverlayGracefully() {
+            // Start a grace-period before hiding — keeps box visible during brief missed frames
+            if (_roiHideTimer) return; // already scheduled
+            _roiHideTimer = setTimeout(() => {
+                const overlay = document.getElementById('roiBoxOverlay');
+                if (overlay) {
+                    overlay.style.transition = 'opacity 0.4s ease';
+                    overlay.style.opacity = '0';
+                    setTimeout(() => {
+                        overlay.classList.add('hidden');
+                        overlay.style.opacity = '1';
+                        overlay.style.transition = '';
+                        _roiCurrent = null;
+                        _roiTarget  = null;
+                        if (_roiRafId) { cancelAnimationFrame(_roiRafId); _roiRafId = null; }
+                    }, 420);
+                }
+                _roiHideTimer = null;
+            }, ROI_HIDE_MS);
         }
 
         // Manual Frame Snapshot
@@ -1688,6 +2289,15 @@ HTML_UI = """<!DOCTYPE html>
 
             if (showAnnotatedImg && result.annotated_image) {
                 document.getElementById('previewImage').src = result.annotated_image;
+            }
+
+            const cropUrl = result.cropped_image || (result.detections && result.detections.length > 0 ? result.detections[0].crop : null);
+            const cropImg = document.getElementById('ocrInputCropImg');
+            const cropCard = document.getElementById('ocrInputCropCard');
+            if (cropUrl && cropImg && cropCard) {
+                cropImg.src = cropUrl;
+                cropCard.classList.remove('hidden');
+                if (window.lucide) lucide.createIcons();
             }
 
             try {
@@ -1896,6 +2506,7 @@ HTML_UI = """<!DOCTYPE html>
         window.addEventListener('DOMContentLoaded', () => {
             checkSecurityContext();
             loadHistory();
+            populateCameraDevices();
             setMode('camera');
         });
     </script>
@@ -1913,6 +2524,13 @@ def index():
 @app.route('/api/camera/stream')
 def api_camera_stream():
     """MJPEG stream for direct hardware webcam capture."""
+    idx = request.args.get('index')
+    if idx is not None:
+        try:
+            camera_streamer.set_index(int(idx))
+        except Exception:
+            pass
+
     def generate():
         while True:
             frame = camera_streamer.get_frame()
@@ -1926,6 +2544,28 @@ def api_camera_stream():
                    b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
             time.sleep(0.035)
     return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/api/camera/select', methods=['GET', 'POST'])
+def api_camera_select():
+    """Select active hardware camera index (e.g. 0 for webcam, 1 for external/phone)."""
+    index = request.args.get('index') or (request.get_json(silent=True) or {}).get('index', 0)
+    try:
+        idx = int(index)
+        camera_streamer.set_index(idx)
+        return jsonify({"success": True, "index": idx})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+
+@app.route('/api/camera/devices', methods=['GET'])
+def api_camera_devices():
+    """Scan and return available OpenCV camera indices."""
+    devices = []
+    for i in range(3):
+        cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+        if cap.isOpened():
+            devices.append({"index": i, "name": f"Hardware Camera {i}"})
+            cap.release()
+    return jsonify({"devices": devices, "current": camera_streamer.index})
 
 @app.route('/api/camera/frame')
 def api_camera_frame():
@@ -1946,7 +2586,7 @@ def api_camera_stop():
 @app.route('/api/plates/recognize', methods=['POST'])
 @app.route('/api/detect', methods=['POST'])
 def api_recognize():
-    """Run YOLO plate detection + EasyOCR character extraction."""
+    """Run YOLOv8 (anpr.pt) plate detection + PaddleOCR character extraction."""
     try:
         file = request.files.get('file') or request.files.get('image')
         if not file or file.filename == '':
@@ -1978,7 +2618,7 @@ def api_scans():
                 "rto": data.get("rto") or "Pune RTO",
                 "confidence": data.get("confidence", 0.98),
                 "mode": data.get("mode", "camera"),
-                "source": data.get("source", "easyocr"),
+                "source": data.get("source", "paddleocr"),
                 "status": data.get("status", "verified"),
                 "scanned_at": datetime.now().isoformat()
             }
